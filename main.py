@@ -5,6 +5,18 @@ import discord
 from discord.ext import commands, tasks
 from config import (DISCORD_TOKEN, DATABASE_PATH, BACKUP_MINUTES as CONFIG_BACKUP_MINUTES, ARCHIVE_DAYS as CONFIG_ARCHIVE_DAYS, LOG_CHANNEL_ID as CONFIG_LOG_CHANNEL_ID, DASHBOARD_KEY as CONFIG_DASHBOARD_KEY, MENU_GIF_URL, HELP_GIF_URL)
 from aiohttp import web
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+
+def find_gif(filename):
+    for path in [
+        BASE_DIR / filename,
+        BASE_DIR / "assets" / filename,
+    ]:
+        if path.is_file():
+            return path
+    return None
 
 TOKEN=os.getenv("DISCORD_TOKEN") or DISCORD_TOKEN
 PREFIX='?'
