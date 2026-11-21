@@ -45,7 +45,10 @@ ASSETS_DIR=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
 
 def gif_attachment(kind):
     path=os.path.join(ASSETS_DIR, f'{kind}.gif')
-    return discord.File(path, filename=f'{kind}.gif') if os.path.isfile(path) else None
+    if not os.path.isfile(path):
+        log.error('Missing GIF asset: %s', path)
+        return None
+    return discord.File(path, filename=f'{kind}.gif')
 
 SECURITY_NAMES={"antinuke":"Anti-Nuke","antiraid":"Anti-Raid","antispam":"Anti-Spam","antilink":"Anti-Link","raidmode":"Raid Mode","antibot":"Anti-Rogue Bot"}
 
@@ -126,6 +129,9 @@ async def make_backup(guild):
 @bot.event
 async def on_ready():
     log.info('All4u online as %s',bot.user)
+    for kind in ('menu','help','backup'):
+        path=os.path.join(ASSETS_DIR, f'{kind}.gif')
+        log.info('GIF %s: %s', kind, 'FOUND' if os.path.isfile(path) else 'MISSING')
     if not getattr(bot,'_all4u_views_registered',False):
         for g in bot.guilds:bot.add_view(SecurityView(g.id))
         bot._all4u_views_registered=True
