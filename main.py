@@ -42,11 +42,20 @@ OWNER_ID=731742317010223154
 MENU_GIF=MENU_GIF_URL.strip()
 HELP_GIF=HELP_GIF_URL.strip()
 ASSETS_DIR=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
+ROOT_DIR=os.path.dirname(os.path.abspath(__file__))
+
+def gif_path(kind):
+    # Support both assets/menu.gif and menu.gif in the GitHub repository root.
+    for base in (ASSETS_DIR, ROOT_DIR):
+        path=os.path.join(base, f'{kind}.gif')
+        if os.path.isfile(path):
+            return path
+    return None
 
 def gif_attachment(kind):
-    path=os.path.join(ASSETS_DIR, f'{kind}.gif')
-    if not os.path.isfile(path):
-        log.error('Missing GIF asset: %s', path)
+    path=gif_path(kind)
+    if path is None:
+        log.error('Missing GIF %s: checked assets/ and repository root', kind)
         return None
     return discord.File(path, filename=f'{kind}.gif')
 
@@ -222,8 +231,8 @@ def decode_overwrites(g,item,role_map):
 async def on_ready():
     log.info('All4u online as %s',bot.user)
     for kind in ('menu','help','backup'):
-        path=os.path.join(ASSETS_DIR, f'{kind}.gif')
-        log.info('GIF %s: %s', kind, 'FOUND' if os.path.isfile(path) else 'MISSING')
+        path=gif_path(kind)
+        log.info('GIF %s: %s%s', kind, 'FOUND' if path else 'MISSING', f' ({path})' if path else '')
     if not getattr(bot,'_all4u_views_registered',False):
         for g in bot.guilds:bot.add_view(SecurityView(g.id))
         bot._all4u_views_registered=True

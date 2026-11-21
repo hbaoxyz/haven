@@ -1,0 +1,1 @@
+Upload only main.py to your existing GitHub repository hbaoxyz/haven. The three GIF files already at repository root (menu.gif, help.gif, backup.gif) will work. The code also supports assets/ as before. Keep DATABASE_PATH=/data/Haven.db and existing Railway Volume.
