@@ -111,20 +111,112 @@ async def notify(guild,text):
         try: await channel.send(text[:1900],allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException: pass
 
+def encode_overwrites(channel):
+    items=[]
+    for target, overwrite in channel.overwrites.items():
+        allow,deny=overwrite.pair()
+        items.append({'type':'role' if isinstance(target,discord.Role) else 'member',
+                      'id':target.id,'allow':allow.value,'deny':deny.value})
+    return items
+
 async def make_backup(guild):
-    data={'guild_name':guild.name,'roles':[], 'categories':[], 'channels':[]}
+    data={'schema':2,'guild_id':guild.id,'guild_name':guild.name,'roles':[],
+          'categories':[],'channels':[],'member_roles':[]}
     for role in guild.roles:
-        if role.is_default() or role.managed: continue
-        data['roles'].append({'name':role.name,'color':role.color.value,'hoist':role.hoist,'mentionable':role.mentionable,'permissions':role.permissions.value,'position':role.position})
+        if role.is_default() or role.managed:continue
+        data['roles'].append({'id':role.id,'name':role.name,'color':role.color.value,
+            'hoist':role.hoist,'mentionable':role.mentionable,
+            'permissions':role.permissions.value,'position':role.position})
     for category in guild.categories:
-        data['categories'].append({'name':category.name,'position':category.position})
+        data['categories'].append({'id':category.id,'name':category.name,
+            'position':category.position,'overwrites':encode_overwrites(category)})
     for channel in guild.channels:
-        if isinstance(channel,discord.CategoryChannel): continue
+        if isinstance(channel,discord.CategoryChannel):continue
         kind='text' if isinstance(channel,discord.TextChannel) else 'voice' if isinstance(channel,discord.VoiceChannel) else 'other'
-        data['channels'].append({'name':channel.name,'type':kind,'category':channel.category.name if channel.category else None,'position':channel.position,'topic':getattr(channel,'topic',None),'nsfw':getattr(channel,'nsfw',False)})
-    conn.execute('INSERT INTO backups(guild,created,data) VALUES(?,?,?)',(guild.id,datetime.now(timezone.utc).isoformat(),json.dumps(data,ensure_ascii=False)))
+        data['channels'].append({'id':channel.id,'name':channel.name,'type':kind,
+            'category_id':channel.category_id,'category':channel.category.name if channel.category else None,
+            'position':channel.position,'topic':getattr(channel,'topic',None),
+            'nsfw':getattr(channel,'nsfw',False),'overwrites':encode_overwrites(channel),
+            'slowmode_delay':getattr(channel,'slowmode_delay',0),
+            'bitrate':getattr(channel,'bitrate',None),'user_limit':getattr(channel,'user_limit',None)})
+    # Discord cache requires Server Members Intent; chunk to fetch members when possible.
+    try:
+        if not guild.chunked:await guild.chunk(cache=True)
+    except (discord.Forbidden,discord.HTTPException,asyncio.TimeoutError):
+        log.warning('Member list incomplete for %s; member-role backup may be partial',guild.id)
+    for member in guild.members:
+        assigned=[r.id for r in member.roles if not r.is_default() and not r.managed]
+        if assigned:data['member_roles'].append({'member_id':member.id,'role_ids':assigned})
+    conn.execute('INSERT INTO backups(guild,created,data) VALUES(?,?,?)',
+                 (guild.id,datetime.now(timezone.utc).isoformat(),json.dumps(data,ensure_ascii=False)))
     conn.commit()
     return data
+
+async def restore_structure(g,data,cancel=None):
+    """Non-destructive: create missing objects; restore assignments/overwrites for new objects only."""
+    created=0;errors=0;role_map={g.default_role.id:g.default_role};cat_map={}
+    for item in sorted(data.get('roles',[]),key=lambda x:x.get('position',0)):
+        if cancel and cancel():break
+        role=g.get_role(item.get('id',0)) or discord.utils.get(g.roles,name=item['name'])
+        if role is None:
+            try:
+                role=await g.create_role(name=item['name'],color=discord.Color(item['color']),
+                    permissions=discord.Permissions(item['permissions']),hoist=item['hoist'],
+                    mentionable=item['mentionable'],reason='Haven restore missing role');created+=1
+            except (discord.Forbidden,discord.HTTPException):errors+=1;continue
+        role_map[item.get('id',role.id)]=role
+    # Position edits are only applied to newly created objects to avoid rearranging existing server.
+    for item in sorted(data.get('categories',[]),key=lambda x:x.get('position',0)):
+        if cancel and cancel():break
+        cat=g.get_channel(item.get('id',0)) or discord.utils.get(g.categories,name=item['name'])
+        new=False
+        if not isinstance(cat,discord.CategoryChannel):
+            try:cat=await g.create_category(item['name'],reason='Haven restore missing category');created+=1;new=True
+            except (discord.Forbidden,discord.HTTPException):errors+=1;continue
+        cat_map[item.get('id',cat.id)]=cat
+        if new:
+            try:await cat.edit(position=item.get('position',cat.position),overwrites=decode_overwrites(g,item,role_map),reason='Haven restore category settings')
+            except (discord.Forbidden,discord.HTTPException):errors+=1
+    for item in sorted(data.get('channels',[]),key=lambda x:x.get('position',0)):
+        if cancel and cancel():break
+        kind=item.get('type')
+        if kind not in ('text','voice'):continue
+        cls=discord.TextChannel if kind=='text' else discord.VoiceChannel
+        existing=g.get_channel(item.get('id',0))
+        if not isinstance(existing,cls):
+            existing=next((ch for ch in g.channels if isinstance(ch,cls) and ch.name==item['name'] and (ch.category_id==item.get('category_id') or ch.category and ch.category.name==item.get('category'))),None)
+        if existing:continue
+        category=cat_map.get(item.get('category_id')) or discord.utils.get(g.categories,name=item.get('category'))
+        options={'category':category,'overwrites':decode_overwrites(g,item,role_map),'reason':'Haven restore missing channel'}
+        try:
+            if kind=='text':
+                ch=await g.create_text_channel(item['name'],topic=item.get('topic'),nsfw=item.get('nsfw',False),slowmode_delay=item.get('slowmode_delay',0),**options)
+            else:
+                voice_opts={k:item[k] for k in ('bitrate','user_limit') if item.get(k) is not None}
+                ch=await g.create_voice_channel(item['name'],**voice_opts,**options)
+            created+=1
+            try:await ch.edit(position=item.get('position',ch.position),reason='Haven restore channel order')
+            except (discord.Forbidden,discord.HTTPException):errors+=1
+        except (discord.Forbidden,discord.HTTPException,TypeError,ValueError):errors+=1
+    # Re-add missing saved roles to existing members, without removing their current roles.
+    for item in data.get('member_roles',[]):
+        if cancel and cancel():break
+        member=g.get_member(item['member_id'])
+        if member is None:continue
+        to_add=[role_map[rid] for rid in item['role_ids'] if rid in role_map and role_map[rid] not in member.roles and role_map[rid]<g.me.top_role]
+        if to_add:
+            try:await member.add_roles(*to_add,reason='Haven restore member role assignments')
+            except (discord.Forbidden,discord.HTTPException):errors+=1
+    return created,errors
+
+def decode_overwrites(g,item,role_map):
+    result={}
+    for entry in item.get('overwrites',[]):
+        target=(role_map.get(entry['id']) or g.get_role(entry['id'])) if entry['type']=='role' else g.get_member(entry['id'])
+        if target is None:continue
+        try:result[target]=discord.PermissionOverwrite.from_pair(discord.Permissions(entry['allow']),discord.Permissions(entry['deny']))
+        except (ValueError,TypeError):continue
+    return result
 
 @bot.event
 async def on_ready():
@@ -337,7 +429,7 @@ async def restore_preview(ctx,ident:int=None):
     if not data:return await ctx.send('Không tìm thấy backup.')
     roles={r.name for r in ctx.guild.roles};categories={c.name for c in ctx.guild.categories};channels={(c.name,'text' if isinstance(c,discord.TextChannel) else 'voice') for c in ctx.guild.channels}
     missing_roles=sum(r['name'] not in roles for r in data['roles']);missing_cats=sum(c['name'] not in categories for c in data['categories']);missing_channels=sum((c['name'],c['type']) not in channels for c in data['channels'] if c['type']!='other')
-    await ctx.send(f'Xem trước: thiếu **{missing_roles} roles**, **{missing_cats} categories**, **{missing_channels} channels**. Dùng `?restore_missing {ident or ""}` để tạo phần thiếu. Không khôi phục được lịch sử Discord hoặc quyền ghi đè phức tạp.')
+    await ctx.send(f'Xem trước: thiếu **{missing_roles} roles**, **{missing_cats} categories**, **{missing_channels} channels**. Dùng `?restore_missing {ident or ""}` để tạo phần thiếu. Bản mới hỗ trợ quyền ghi đè cho kênh được tạo lại và gán lại role thành viên khi có thể.')
 
 @bot.command(name='restore_missing')
 @commands.guild_only()
@@ -345,27 +437,8 @@ async def restore_preview(ctx,ident:int=None):
 async def restore_missing(ctx,ident:int=None):
     data=get_backup(ctx.guild.id,ident)
     if not data:return await ctx.send('Không tìm thấy backup.')
-    g=ctx.guild;created=0
-    for r in data['roles']:
-        if discord.utils.get(g.roles,name=r['name']):continue
-        try:
-            await g.create_role(name=r['name'],color=discord.Color(r['color']),permissions=discord.Permissions(r['permissions']),hoist=r['hoist'],mentionable=r['mentionable'],reason='All4u restore');created+=1
-        except (discord.Forbidden,discord.HTTPException):pass
-    for c in data['categories']:
-        if discord.utils.get(g.categories,name=c['name']):continue
-        try:await g.create_category(c['name'],reason='All4u restore');created+=1
-        except (discord.Forbidden,discord.HTTPException):pass
-    for c in data['channels']:
-        if c['type'] not in ('text','voice'):continue
-        existing=any(x.name==c['name'] and ((c['type']=='text' and isinstance(x,discord.TextChannel)) or (c['type']=='voice' and isinstance(x,discord.VoiceChannel))) for x in g.channels)
-        if existing:continue
-        category=discord.utils.get(g.categories,name=c['category']) if c['category'] else None
-        try:
-            if c['type']=='text':await g.create_text_channel(c['name'],category=category,topic=c.get('topic'),nsfw=c.get('nsfw',False),reason='All4u restore')
-            else:await g.create_voice_channel(c['name'],category=category,reason='All4u restore')
-            created+=1
-        except (discord.Forbidden,discord.HTTPException):pass
-    await ctx.send(f'✅ Đã tạo {created} mục bị thiếu. Các mục hiện có được giữ nguyên.')
+    created,errors=await restore_structure(ctx.guild,data)
+    await ctx.send(f'✅ Đã tạo {created} role/danh mục/kênh bị thiếu, khôi phục role thành viên khi có thể. Lỗi: {errors}. Không xóa mục hiện có.')
 
 @bot.command(name='message_restore')
 @commands.guild_only()
@@ -644,32 +717,11 @@ async def run_full_recovery(ctx,backup_id):
     if not data:return await ctx.send('❌ Không tìm thấy bản sao lưu.')
     recovery_cancel_flags[g.id]=False
     recovery_job(g.id,'running','Starting non-destructive recovery')
-    created=0;errors=0
     try:
-        for r in sorted(data.get('roles',[]),key=lambda x:x.get('position',0)):
-            if recovery_cancel_flags.get(g.id):break
-            if discord.utils.get(g.roles,name=r['name']):continue
-            try:
-                await g.create_role(name=r['name'],color=discord.Color(r['color']),permissions=discord.Permissions(r['permissions']),hoist=r['hoist'],mentionable=r['mentionable'],reason='All4u full recovery');created+=1
-            except (discord.Forbidden,discord.HTTPException):errors+=1
-        for c in data.get('categories',[]):
-            if recovery_cancel_flags.get(g.id):break
-            if discord.utils.get(g.categories,name=c['name']):continue
-            try:await g.create_category(c['name'],reason='All4u full recovery');created+=1
-            except (discord.Forbidden,discord.HTTPException):errors+=1
-        for c in data.get('channels',[]):
-            if recovery_cancel_flags.get(g.id):break
-            if c['type'] not in ('text','voice'):continue
-            if any(x.name==c['name'] and ((c['type']=='text' and isinstance(x,discord.TextChannel)) or (c['type']=='voice' and isinstance(x,discord.VoiceChannel))) for x in g.channels):continue
-            category=discord.utils.get(g.categories,name=c['category']) if c.get('category') else None
-            try:
-                if c['type']=='text':await g.create_text_channel(c['name'],category=category,topic=c.get('topic'),nsfw=c.get('nsfw',False),reason='All4u full recovery')
-                else:await g.create_voice_channel(c['name'],category=category,reason='All4u full recovery')
-                created+=1
-            except (discord.Forbidden,discord.HTTPException):errors+=1
+        created,errors=await restore_structure(g,data,lambda:recovery_cancel_flags.get(g.id,False))
         state='cancelled' if recovery_cancel_flags.get(g.id) else 'completed'
         recovery_job(g.id,state,f'created={created}; errors={errors}')
-        await ctx.send(f'♻️ Recovery {state}: đã tạo {created} mục, lỗi quyền/API: {errors}. Không xóa mục hiện có.')
+        await ctx.send(f'♻️ Recovery {state}: tạo {created} mục, lỗi {errors}; không xóa mục hiện có.')
     except Exception as e:
         recovery_job(g.id,'failed',str(e)[:300]);log.exception('recovery failed')
         await ctx.send('⚠️ Recovery lỗi; xem Deploy Logs.')
@@ -720,7 +772,7 @@ async def dashboard(request):
     return web.json_response({'bot':str(bot.user),'guilds':[{'id':g.id,'name':g.name,'members':g.member_count} for g in bot.guilds]})
 
 async def main():
-    if not TOKEN:raise RuntimeError('Set DISCORD_TOKEN in config.py')
+    if not TOKEN:raise RuntimeError('Set DISCORD_TOKEN in Railway Variables')
     app=web.Application();app.router.add_get('/health',health);app.router.add_get('/api/status',dashboard)
     runner=web.AppRunner(app);await runner.setup();await web.TCPSite(runner,'0.0.0.0',PORT).start()
     try:await bot.start(TOKEN)

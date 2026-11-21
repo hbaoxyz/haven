@@ -1,19 +1,7 @@
-# Haven / All4u — GIF fix
+# Haven All4u — Full Server Backup
 
-Upload **all files and the assets folder** to the ROOT of your GitHub repository.
+Giữ nguyên các lệnh và 3 GIF trong assets/. Sao lưu bổ sung ID role/category/channel, permission overwrites, vị trí, và role của thành viên bot nhìn thấy. `?backup_create` tạo bản sao lưu mới; `?restore_preview` xem phần thiếu; `?restore_missing` và `?recovery_full` tạo phần thiếu, áp dụng quyền kênh mới, gán lại role đã lưu khi đủ quyền. Không xóa kênh hoặc role hiện có.
 
-Expected:
-- main.py
-- config.py
-- requirements.txt
-- Procfile
-- assets/menu.gif
-- assets/help.gif
-- assets/backup.gif
+Railway: `DISCORD_TOKEN` và `DATABASE_PATH=/data/Haven.db`, Volume mount `/data`, Start Command `python main.py`, 1 replica. Bật Message Content Intent và Server Members Intent. Cấp quyền Manage Roles, Manage Channels, View Audit Log; role của bot phải cao hơn role cần phục hồi. Sau khi Deploy, chạy `?backup_create` để tạo backup schema mới (backup cũ không chứa member-role/overwrites).
 
-Railway Variables: DISCORD_TOKEN=<secret>, DATABASE_PATH=/data/Haven.db
-Railway Start Command: python main.py
-Mount a persistent Volume at /data before storing valuable data.
-
-Check Deploy Logs: GIF menu: FOUND / GIF help: FOUND / GIF backup: FOUND.
-Test ?menu, ?help, ?backup. Do not publish bot tokens or database snapshots.
+Giới hạn: không phục hồi được ID gốc, tin nhắn đã xóa trước khi bot lưu, file đính kèm, emoji, webhook, role managed, một số loại kênh khác Text/Voice, và các quyền không đủ để cấp. Thứ tự role hiện có không bị sửa; thứ tự các kênh mới được khôi phục ở mức tốt nhất. Tên trùng có thể gây đối sánh không chính xác. Sao lưu database ra ngoài Railway Volume định kỳ.
